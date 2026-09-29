@@ -61,7 +61,14 @@ DB_FLOOR = -60.0          # нижняя граница шкал в дБ
 CSD_FLOOR_DB = -40.0      # динамический диапазон спектрального распада
 CSD_SLICES = 48
 TICKS_HZ = (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000)
-OCTAVE_CENTERS = (63, 125, 250, 500, 1000, 2000, 4000, 8000)
+# Полуоктавные полосы 31 Гц – 11 кГц: вдвое подробнее октавных. Снизу — с 31 Гц,
+# чтобы захватить основной тон нижней струны восьмиструнки (F#1 ≈ 46 Гц, Drop E
+# ≈ 41 Гц — полоса 44 Гц, 37–53 Гц); сверху — до 11 кГц, где виден спад динамика.
+# Центры — точные 1000·2^(n/2), подписи — округлённые номиналы.
+BAND_CENTERS = tuple(1000 * 2 ** (n / 2) for n in range(-10, 8))
+BAND_LABELS = ('31', '44', '63', '88', '125', '177', '250', '354', '500', '707',
+               '1к', '1.4к', '2к', '2.8к', '4к', '5.7к', '8к', '11к')
+BAND_HALF_WIDTH = 2 ** 0.25        # полоса — от fc/2^(1/4) до fc·2^(1/4)
 ALIGN_BAND_HZ = (200.0, 2000.0)  # выравнивание кривых АЧХ по среднему уровню здесь
 LABEL_GAP_DB = 3.5        # минимальный зазор между прямыми подписями кривых
 # Суффикс, который iroptimizator добавляет к имени результата: _48k24b_984…
@@ -106,19 +113,19 @@ def energy_decay(x, sr):
     return t, 20 * np.log10(env / peak + 1e-30)
 
 
-def octave_energy(x, sr):
-    """Энергия по октавным полосам в дБ относительно самой громкой полосы."""
+def band_energy(x, sr):
+    """Энергия по полуоктавным полосам в дБ относительно самой громкой полосы."""
     n = 1 << max(FFT_MIN_BITS, (len(x) - 1).bit_length())
     power = np.abs(np.fft.rfft(x, n)) ** 2
     freqs = np.fft.rfftfreq(n, 1 / sr)
     levels = []
-    for fc in OCTAVE_CENTERS:
-        m = (freqs >= fc / np.sqrt(2)) & (freqs < fc * np.sqrt(2))
+    for fc in BAND_CENTERS:
+        m = (freqs >= fc / BAND_HALF_WIDTH) & (freqs < fc * BAND_HALF_WIDTH)
         levels.append(power[m].sum() if m.any() else 0.0)
     levels = np.array(levels)
     top = levels.max()
     if top <= 0:
-        return np.full(len(OCTAVE_CENTERS), DB_FLOOR)
+        return np.full(len(BAND_CENTERS), DB_FLOOR)
     return 10 * np.log10(levels / top + 1e-30)
 
 
@@ -294,7 +301,7 @@ def draw(items, out_path, fraction, imp_ms, etc_ms, dpi, align='band'):
     """items: список (подпись, сигнал, частота). Рисует PNG со сводкой."""
     single = len(items) == 1
     table_share = 0.16 + 0.05 * len(items)
-    fig = plt.figure(figsize=(12, 12.5 + 0.35 * len(items)))
+    fig = plt.figure(figsize=(18, 12.5 + 0.35 * len(items)))   # шире: 16 полос × до 8 файлов
     fig.patch.set_facecolor(SURFACE)
     gs = GridSpec(5, 2, figure=fig,
                   height_ratios=[1.15, 0.95, 1.0, 0.9, table_share],
@@ -419,17 +426,27 @@ def draw(items, out_path, fraction, imp_ms, etc_ms, dpi, align='band'):
     ax_etc.set_xlim(0, etc_ms)
     ax_etc.set_ylim(DB_FLOOR, 3)
 
-    style_axes(ax_oct, 'Энергия по октавным полосам', 'Полоса, Гц',
+    style_axes(ax_oct, 'Энергия по полуоктавным полосам', 'Полоса, Гц',
                'Уровень, дБ')
-    idx = np.arange(len(OCTAVE_CENTERS))
+    idx = np.arange(len(BAND_CENTERS))
     span = 0.8 / len(items)
     for i, (label, x, sr) in enumerate(items):
-        levels = octave_energy(x, sr)
+        levels = band_energy(x, sr)
         ax_oct.bar(idx - 0.4 + span * (i + 0.5), np.maximum(levels, DB_FLOOR) - DB_FLOOR,
                    bottom=DB_FLOOR, width=span * 0.88, color=SERIES[i % len(SERIES)],
                    label=label, edgecolor=SURFACE, linewidth=1.2)
+    # Полосы, центр которых ниже удвоенного разрешения окна самого короткого
+    # файла, закрашены, как зона на АЧХ: у короткого IR их уровень задаёт длина
+    # окна (полка от незавершённого спада кабинета), а не сам кабинет.
+    limited = [k for k, fc in enumerate(BAND_CENTERS) if fc < window_hz]
+    if limited:
+        ax_oct.axvspan(-0.5, limited[-1] + 0.5, color=GRID, alpha=0.45, linewidth=0, zorder=0)
+        ax_oct.text(-0.45, 1.5, f'ниже {window_hz:.0f} Гц уровень задаёт длина окна '
+                    f'({len(shortest[1])} сэмпл.)', color=INK_MUTED, fontsize=8,
+                    va='top', ha='left')
     ax_oct.set_xticks(idx)
-    ax_oct.set_xticklabels([hz_formatter(f, None) for f in OCTAVE_CENTERS])
+    ax_oct.set_xticklabels(BAND_LABELS)
+    ax_oct.set_xlim(-0.5, len(BAND_CENTERS) - 0.5)
     ax_oct.set_ylim(DB_FLOOR, 3)
     ax_oct.grid(True, axis='y', color=GRID, linewidth=0.7)
     ax_oct.grid(False, axis='x')
